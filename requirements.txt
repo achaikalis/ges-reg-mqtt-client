@@ -1,0 +1,6 @@
+bleak==2.0.0
+-e git+https://github.com/eclipse/paho.mqtt.python@d45de3737879cfe7a6acc361631fa5cb1ef584bb#egg=paho_mqtt
+pyobjc-core==12.1
+pyobjc-framework-Cocoa==12.1
+pyobjc-framework-CoreBluetooth==12.1
+pyobjc-framework-libdispatch==12.1
