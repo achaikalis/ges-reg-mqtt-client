@@ -1,21 +1,20 @@
-import json
-import time
-import struct
-import asyncio
-import logging
-import argparse
+import json, time, struct, asyncio, logging, argparse
 
 from uuid import UUID
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, List, Union
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 import paho.mqtt.client as mqtt
-import paho.mqtt.publish as publish
 from paho.mqtt.client import connack_string as ack
+
+import paho.mqtt.publish as publish
+from paho.mqtt.publish import MessageDict, MessageTuple
+
+from paho.mqtt.enums import MQTTProtocolVersion
 
 # NOTE: You should set clean_session = False if you need the QoS 2 guarantee of only one delivery
 
@@ -32,20 +31,21 @@ CLASSIFICATION_UUIDS = {
     "classification_anomaly"   : str(UUID("aaec8b2e-207f-41ec-98f3-0bf25910a18d")).lower(),
 }
 
-classification_data      : dict[str, Any]  = {}
-classification_timestamp : Optional[int]   = None
-classification_value     : Optional[float] = None
-classification_label     : Optional[str]   = None
-classification_anomaly   : Optional[float] = None
-
 TIMING_UUIDS = {
     "dsp_timing"            : str(UUID("8e097b91-55e5-4503-b4dd-98d819b8240f")).lower(),
     "timing_classification" : str(UUID("7951b2bf-b7aa-4426-8e48-2cffeaa57cae")).lower(),
     "timing_anomaly"        : str(UUID("831d524f-4657-47a7-aa6d-2998b87a99aa")).lower(),
 }
 
-# TODO: Publish DSP Timing Data
-# timing_data          : dict[str, Any] = {}
+messages : List[Union[MessageDict, MessageTuple]] = []
+
+classification_data      : dict[str, Any]  = {}
+classification_timestamp : Optional[int]   = None
+classification_value     : Optional[float] = None
+classification_label     : Optional[str]   = None
+classification_anomaly   : Optional[float] = None
+
+timing_data           : dict[str, Any] = {}
 dsp_timing            : Optional[int]  = None
 timing_classification : Optional[int]  = None
 timing_anomaly        : Optional[int]  = None
@@ -53,7 +53,6 @@ timing_anomaly        : Optional[int]  = None
 class Args(argparse.Namespace):
     name              : Optional[str]
     address           : Optional[str]
-    macos_use_bdaddr  : bool = False    # CoreBluetooth API-specifics
     services          : list[str]
     pair              : bool            # Pairing functionality is not implemented in the CoreBluetooth API 
     debug             : bool
@@ -128,7 +127,8 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                         char_uuid = characteristic.uuid.lower()
 
                         if (
-                            char_uuid == CLASSIFICATION_UUIDS["classification_timestamp"]
+                            char_uuid
+                            == CLASSIFICATION_UUIDS["classification_timestamp"]
                         ):
                             try:
                                 if len(value) != 8:
@@ -139,7 +139,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                     (ts,) = struct.unpack("<Q", value)
                                     classification_timestamp = ts
                                     logger.info(f"Classification Timestamp: {ts}")
-                                    publish_message()
                             except Exception as e:
                                 logger.error(
                                     f"Failed to unpack timestamp value: {e}, raw value: {value}"
@@ -155,7 +154,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                     (val,) = struct.unpack("<f", value)
                                     classification_value = val
                                     logger.info(f"Classification Value: {val}")
-                                    publish_message()
                             except Exception as e:
                                 logger.error(
                                     f"Failed to unpack classification value: {e}, raw value: {value}"
@@ -166,7 +164,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                 label = value.decode("utf-8").strip("\x00")
                                 classification_label = label
                                 logger.info(f"Classification Label: {label}")
-                                publish_message()
                             except Exception as e:
                                 logger.error(
                                     f"Failed to decode classification label: {e}, raw value: {value}"
@@ -184,7 +181,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                     (anomaly,) = struct.unpack("<f", value)
                                     classification_anomaly = anomaly
                                     logger.info(f"Classification Anomaly: {anomaly}")
-                                    publish_message()
                             except Exception as e:
                                 logger.error(
                                     f"Failed to unpack classification anomaly: {e}, raw value: {value}"
@@ -239,6 +235,8 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                             f"Characteristic: {characteristic.uuid}, {characteristic.handle}, ({characteristic.description}, {characteristic.properties}): {value}"
                         )
 
+                        publish_message()
+
                     except Exception as e:
                         logger.error(
                             f"Failed to read characteristic with UUID: {characteristic.uuid}: {e}"
@@ -267,11 +265,13 @@ async def discover_ble_devices():
 
 
 def on_connect(
-    client: mqtt.Client,
-    userdata: Any,
-    connect_flags: mqtt.ConnectFlags,
-    reason_code: mqtt.ReasonCode,
-    properties: Optional[Any] = None,
+    # fmt: off
+    client        : mqtt.Client,
+    userdata      : Any,
+    connect_flags : mqtt.ConnectFlags,
+    reason_code   : mqtt.ReasonCode,
+    properties    : Optional[Any] = None,
+    # fmt: on
 ):
     print(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
@@ -307,11 +307,13 @@ def on_connect_fail(client: mqtt.Client, userdata: Any):
 
 
 def on_disconnect(
-    client: mqtt.Client,
-    userdata: Any,
-    disconnect_flags: mqtt.DisconnectFlags,
-    reason_code: mqtt.ReasonCode,
-    properties: Optional[Any] = None,
+    # fmt: off
+    client              : mqtt.Client,
+    userdata            : Any,
+    disconnect_flags    : mqtt.DisconnectFlags,
+    reason_code         : mqtt.ReasonCode,
+    properties          : Optional[Any] = None,
+    # fmt: on
 ):
     print(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
@@ -347,10 +349,12 @@ def on_disconnect(
 
 
 def on_message(
-    client: mqtt.Client,
-    userdata: Any,
-    message: mqtt.MQTTMessage,
-    properties: Optional[Any] = None,
+    # fmt: off
+    client     : mqtt.Client,
+    userdata   : Any,
+    message    : mqtt.MQTTMessage,
+    properties : Optional[Any] = None,
+    # fmt: on
 ):
     print(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
@@ -391,40 +395,47 @@ def on_publish(client: mqtt.Client, userdata: Any, mid: int):
 """
 
 
-# def publish_message(topic: str, payload: str, qos: int = 0, retain: bool = False):
-#     publish.single(
-#         topic,
-#         payload,
-#         qos,
-#         retain,
-#         hostname="10.10.XXX.XXX",
-#         port=8443,
-#         client_id="gesture-control-wearable",
-#         keepalive=60,
-#         will=None,
-#         auth=None,
-#         tls=None,
-#         protocol=mqtt.MQTTv311,
-#         transport="tcp",
-#     )
-
-
 def publish_message():
     global classification_timestamp, classification_value, classification_label, classification_anomaly
+    global timing_data, dsp_timing, timing_classification, timing_anomaly
 
     classification_data: dict[str, Any] = {
-        "timestamp" : classification_timestamp,
-        "value"     : classification_value,
-        "label"     : classification_label,
-        "anomaly"   : classification_anomaly
+        "timestamp": classification_timestamp,
+        "value": classification_value,
+        "label": classification_label,
+        "anomaly": classification_anomaly,
     }
-   
+
+    timing_data: dict[str, Any] = {
+        "dsp_timing": dsp_timing,
+        "timing_classification": timing_classification,
+        "timing_anomaly": timing_anomaly,
+    }
+
+    messages: List[Union[MessageDict, MessageTuple]] = [
+        {
+            "topic": "internal/gesture-classifications",
+            "payload": json.dumps(classification_data),
+            "qos": 0,
+            "retain": False,
+        },
+
+        {
+            "topic": "internal/dsp-timings",
+            "payload": json.dumps(timing_data),
+            "qos": 0,
+            "retain": False,
+        },
+    ]
+
     try:
-        payload = json.dumps(classification_data)
-        publish.single("internal/gesture-classifications", payload)
-        logger.info(f"Published payload: {payload}")
+        publish.multiple(
+            messages, hostname="XXX.XXX.XXX.XXX", protocol=MQTTProtocolVersion.MQTTv31
+        )
+        logger.info(f"Published messages: {messages}")
     except Exception as e:
         logger.error(f"Failed to publish classification data: {e}")
+
 
 if __name__ == "__main__":
     # Client-side Logger Setup
@@ -458,13 +469,6 @@ if __name__ == "__main__":
 
     # Address Argument (required if name not provided)
     parser.add_argument("--address", type=str, help="MAC Address for BLE Peripheral")
-
-    # macOS CoreBluetooth API specific argument
-    parser.add_argument(
-        "--macos-use-bdaddr",
-        action="store_true",
-        help="Use Bluetooth Address on macOS",
-    )
 
     # Services Argument (optional)
     parser.add_argument(
@@ -506,5 +510,8 @@ if __name__ == "__main__":
 
         mqttc.connect("XXX.XXX.XXX.XXX", 8843, 60)
         mqttc.loop_forever()
+
+        asyncio.run(read_gatt_server_characteristics(args))
+
     except Exception as e:
-        logger.error(f"Exception occured with error code: {e}")
+        logger.error(f"An exception has occured: {e}")
