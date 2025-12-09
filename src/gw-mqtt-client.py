@@ -509,7 +509,7 @@ if __name__ == "__main__":
         # fmt: on
 
         mqttc.connect("XXX.XXX.XXX.XXX", 8843, 60)
-        mqttc.loop_forever()
+        mqttc.loop_start()        #mqttc.loop_forever() --> infinite loop
 
         asyncio.run(read_gatt_server_characteristics(args))
 
