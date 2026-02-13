@@ -9,12 +9,15 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 import paho.mqtt.client as mqtt
-from paho.mqtt.client import connack_string as ack
-
 import paho.mqtt.publish as publish
+
+from paho.mqtt.client import connack_string as ack
 from paho.mqtt.publish import MessageDict, MessageTuple
 
-from paho.mqtt.enums import MQTTProtocolVersion
+from paho.mqtt.reasoncodes import ReasonCode
+from paho.mqtt.enums import MQTTProtocolVersion, CallbackAPIVersion
+
+reason_code   : ReasonCode
 
 # NOTE: You should set clean_session = False if you need the QoS 2 guarantee of only one delivery
 
@@ -269,7 +272,7 @@ def on_connect(
     client        : mqtt.Client,
     userdata      : Any,
     connect_flags : mqtt.ConnectFlags,
-    reason_code   : mqtt.ReasonCode,
+    reason_code   : ReasonCode,
     properties    : Optional[Any] = None,
     # fmt: on
 ):
@@ -311,7 +314,7 @@ def on_disconnect(
     client              : mqtt.Client,
     userdata            : Any,
     disconnect_flags    : mqtt.DisconnectFlags,
-    reason_code         : mqtt.ReasonCode,
+    reason_code         : ReasonCode,
     properties          : Optional[Any] = None,
     # fmt: on
 ):
@@ -492,7 +495,7 @@ if __name__ == "__main__":
         mqttc = mqtt.Client(
             client_id="gesture-control-wearable",
             transport="tcp",
-            callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+            callback_api_version=CallbackAPIVersion.VERSION2,
             clean_session=True,
         )
 
