@@ -605,7 +605,7 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
 
     # File Handler Configuration
-    file_handler = logging.FileHandler("mqtt-client-logs.txt")
+    file_handler = logging.FileHandler("../logs/mqtt-client-logs.txt")
     file_handler.setLevel(logging.INFO)
 
     # Console Handler Configuration
