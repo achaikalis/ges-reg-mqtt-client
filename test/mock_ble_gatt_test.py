@@ -5,11 +5,13 @@ adapter, no broker, no Raspberry Pi needed) by stubbing BleakScanner,
 BleakClient and the paho MQTT client inside the module under test.
 
 Usage:
-    python3 test/mock_ble_gatt_test.py
+    python3 test/mock_ble_gatt_test.py --address 86:d5:2c:45:e7:3c --broker localhost --port 1883
 """
 
+import argparse
 import asyncio
 import importlib.util
+import json
 import logging
 import struct
 import sys
@@ -115,19 +117,19 @@ class FakeMqttClient:
         self.published.append((topic, payload))
 
 
-async def main():
+async def main(args):
     mod = load_module()
 
-    device = mod.BLEDevice("86:d5:2c:45:e7:3c", "Nano33", None)
+    device = mod.BLEDevice(args.address, "Nano33", None)
     fake_client = FakeClient()
 
     class FakeScanner:
         @staticmethod
         async def find_device_by_address(address, timeout=10.0, **kwargs):
-            return device if address == "86:d5:2c:45:e7:3c" else None
+            return device if address == args.address else None
 
     mod.BleakScanner = FakeScanner
-    mod.BleakClient = lambda *args, **kwargs: fake_client
+    mod.BleakClient = lambda *a, **kwargs: fake_client
     mod.mqtt = SimpleNamespace(Client=FakeMqttClient)
 
     # Terminate the infinite read loop after two cycles via a patched sleep.
@@ -143,32 +145,24 @@ async def main():
     asyncio.sleep = counting_sleep
     mod.asyncio.sleep = counting_sleep
 
-    args = mod.Args()
-    args.name = None
-    args.address = "86:d5:2c:45:e7:3c"
-    args.broker = "localhost"
-    args.port = 1883
-    args.services = []
-    args.pair = False
-    args.debug = False
+    module_args = mod.Args()
+    module_args.name = None
+    module_args.address = args.address
+    module_args.broker = args.broker
+    module_args.port = args.port
+    module_args.services = []
+    module_args.pair = False
+    module_args.debug = False
 
     try:
-        await mod.read_gatt_server_characteristics(args)
+        await mod.read_gatt_server_characteristics(module_args)
     except asyncio.CancelledError:
         pass
 
     mqttc = mod.mqttc
     topics = [t for t, _ in mqttc.published]
-    classifications = [
-        __import__("json").loads(p)
-        for t, p in mqttc.published
-        if t == "internal/gesture-classifications"
-    ]
-    timings = [
-        __import__("json").loads(p)
-        for t, p in mqttc.published
-        if t == "internal/dsp-timings"
-    ]
+    classifications = [json.loads(p) for t, p in mqttc.published if t == "internal/gesture-classifications"]
+    timings = [json.loads(p) for t, p in mqttc.published if t == "internal/dsp-timings"]
     power = [(t, p) for t, p in mqttc.published if t == "cmnd/sofa/POWER"]
 
     failures = []
@@ -207,4 +201,10 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(
+        description="Mock pre-deployment test for the BLE Central (no BLE adapter or broker needed)"
+    )
+    parser.add_argument("--address", type=str, default="86:d5:2c:45:e7:3c", help="MAC Address for BLE Peripheral")
+    parser.add_argument("--broker", type=str, default="localhost", help="MQTT Broker Address")
+    parser.add_argument("--port", type=int, default=1883, help="MQTT Broker Port")
+    asyncio.run(main(parser.parse_args()))
