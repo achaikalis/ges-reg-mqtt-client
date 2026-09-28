@@ -1,28 +1,14 @@
-import json
-import time
 import struct
 import asyncio
 import logging
 import argparse
 
 from uuid import UUID
-from datetime import datetime
 from typing import Any, Optional, List
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
-
-import paho.mqtt.client as mqtt
-
-from paho.mqtt.client import connack_string as ack
-
-from paho.mqtt.reasoncodes import ReasonCode
-from paho.mqtt.enums import CallbackAPIVersion
-
-reason_code   : ReasonCode
-
-# NOTE: You should set clean_session = False if you need the QoS 2 guarantee of only one delivery
 
 # fmt: off
 RECONNECT_RATE        : int = 2
@@ -51,8 +37,6 @@ classification_anomaly   : Optional[float] = None
 dsp_timing               : Optional[int]   = None
 classification_timing    : Optional[int]   = None
 anomaly_timing           : Optional[int]   = None
-
-mqttc : Optional[mqtt.Client] = None  # Global MQTT client reference
 
 class Args(argparse.Namespace):
     name              : Optional[str]
@@ -120,36 +104,6 @@ async def find_ble_device(address: Optional[str], name: Optional[str], use_bdadd
 
 
 async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = False):
-    # MQTT Client Constructor with Callback API Version 2
-    # Initialize AFTER device discovery to avoid blocking BLE scan
-    global mqttc
-    
-    mqttc = mqtt.Client(
-        client_id="gesture-control-wearable",
-        transport="tcp",
-        callback_api_version=CallbackAPIVersion.VERSION2,
-        clean_session=True,
-    )
-
-    # Enable MQTT Logging
-    mqttc.enable_logger()
-
-    # Callback Function Bindings
-    # fmt: off
-    mqttc.on_connect      = on_connect
-    mqttc.on_connect_fail = on_connect_fail
-    mqttc.on_disconnect   = on_disconnect
-    mqttc.on_message      = on_message
-    mqttc.on_publish      = on_publish
-    # fmt: on
-
-    # Connect to MQTT broker (now non-blocking in context of device discovery)
-    try:
-        mqttc.connect("10.10.30.200", 1883, 60)
-        mqttc.loop_start()
-    except Exception as e:
-        logger.warning(f"MQTT connection failed: {e}. Continuing with BLE scan only.")
-    
     # Find BLE device with fallback for macOS
     device = await find_ble_device(args.address, args.name, args.macos_use_bdaddr)
     
@@ -299,7 +253,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                         (timing,) = struct.unpack("<I", value)
                                         dsp_timing = timing
                                         logger.info(f"DSP Timing: {timing} ms")
-                                        publish_dsp_timings()
                                 except Exception as e:
                                     logger.error(
                                         f"Failed to unpack DSP timing: {e}, raw value: {value}"
@@ -315,7 +268,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                         (timing,) = struct.unpack("<I", value)
                                         classification_timing = timing
                                         logger.info(f"Classification Timing: {timing} ms")
-                                        publish_dsp_timings()
                                 except Exception as e:
                                     logger.error(
                                         f"Failed to unpack classification timing: {e}, raw value: {value}"
@@ -331,7 +283,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                         (timing,) = struct.unpack("<I", value)
                                         anomaly_timing = timing
                                         logger.info(f"Anomaly Timing: {timing} ms")
-                                        publish_dsp_timings()
                                 except Exception as e:
                                     logger.error(
                                         f"Failed to unpack anomaly timing: {e}, raw value: {value}"
@@ -341,8 +292,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                 f"Characteristic: {characteristic.uuid}, {characteristic.handle}, ({characteristic.description}, {characteristic.properties}): {value}"
                             )
 
-                            publish_message()
-                            logger.info(f"[{service_count}.{char_index}] Characteristic processed and published.")
+                            logger.info(f"[{service_count}.{char_index}] Characteristic processed.")
 
                         except asyncio.TimeoutError:
                             logger.warning(f"[{service_count}.{char_index}] Characteristic read TIMEOUT (5 sec) - device may be busy")
@@ -380,223 +330,6 @@ async def discover_ble_devices():
     scanner = BleakScanner(on_device_discovery_callback)
     await scanner.start()
     await scanner.stop()
-
-
-"""
-    The callback function for when the client receives a CONNACK response from the broker.
-
-    Args:
-       client, userdata, connect_flags, reason_code, properties 
-
-"""
-
-
-def on_connect(
-    # fmt: off
-    client        : mqtt.Client,
-    userdata      : Any,
-    connect_flags : mqtt.ConnectFlags,
-    reason_code   : ReasonCode,
-    properties    : Optional[Any] = None,
-    # fmt: on
-):
-    print(
-        datetime.now().strftime("%H:%M:%S.%f")[:-2]
-        + " Connection returned result code: "
-        + ack(reason_code)
-    )
-
-
-"""
-    The callback function for when the client reconnects after a failed connection attempt.
-
-    Args:
-        client   : The MQTT client instance.
-        userdata : The user data associated with the client.
-
-"""
-
-
-def on_connect_fail(client: mqtt.Client, userdata: Any):
-    print(
-        datetime.now().strftime("%H:%M:%S.%f")[:-2]
-        + " Reconnecting after failed connection attempt."
-    )
-
-
-"""
-    The callback function for when the client disconnects from the broker gracefully.
-
-    Args:
-        client, userdata, connect_flags, reason_code, properties.
-
-"""
-
-
-def on_disconnect(
-    # fmt: off
-    client              : mqtt.Client,
-    userdata            : Any,
-    disconnect_flags    : mqtt.DisconnectFlags,
-    reason_code         : ReasonCode,
-    properties          : Optional[Any] = None,
-    # fmt: on
-):
-    print(
-        datetime.now().strftime("%H:%M:%S.%f")[:-2]
-        + " Disconnection returned result code: "
-        + ack(reason_code)
-    )
-
-    reconnect_count, reconnect_delay = 0, FIRST_RECONNECT_DELAY
-    while reconnect_count < MAX_RECONNECT_COUNT:
-        logging.info("Reconnecting in %d seconds ...", reconnect_delay)
-        time.sleep(reconnect_delay)
-
-        try:
-            client.reconnect()
-            logging.info("Reconnected successfully!")
-            return
-        except Exception as err:
-            logging.error("%s. Reconnect failed. Retrying...", err)
-
-        reconnect_delay *= RECONNECT_RATE
-        reconnect_delay = min(reconnect_delay, MAX_RECONNECT_DELAY)
-        reconnect_count += 1
-    logging.info("Reconnect failed after %s attempts. Exiting ...", reconnect_count)
-
-
-"""
-    The callback function for when a PUBLISH message is received from the server.
-
-    Args:
-        client, userdata, connect_flags, reason_code, properties
-
-"""
-
-
-def on_message(
-    # fmt: off
-    client     : mqtt.Client,
-    userdata   : Any,
-    message    : mqtt.MQTTMessage,
-    properties : Optional[Any] = None,
-    # fmt: on
-):
-    print(
-        datetime.now().strftime("%H:%M:%S.%f")[:-2]
-        + " Received message with payload: %s on topic: %s with QoS level: %s"
-        % (str(message.payload), message.topic, str(message.qos))
-    )
-
-
-"""
-    The callback function for when a message is sent to the broker. The QoS level determines at what moment the functions is called.
-
-    QoS == 0, it's called as soon as the message is sent over the network. This could be before the corresponding publish() return,
-    QoS == 1, it's called when the corresponding PUBACK is received from the broker,
-    QoS == 2, it's called when the corresponding PUBCOMP is received from the broker.
-
-    Args:
-        mqttc, topic, payload, qos=0, retain=False
-
-"""
-
-
-def on_publish(client: mqtt.Client, userdata: Any, mid: int, reason_code=None, properties=None):
-    logger.debug(
-        f"Message published with ID: {mid}"
-    )
-
-
-"""
-    Publishes a single message to a specified MQTT topic.
-
-    Args:
-        topic (str): The MQTT topic to publish to.
-        payload (str): The message payload.
-        qos (int, optional): The Quality of Service level. Defaults to 0.
-        retain (bool, optional): Whether to retain the message. Defaults to False.  
-
-"""
-
-
-def publish_message():
-    global classification_timestamp, classification_value, classification_label, classification_anomaly
-    global classification_data, mqttc
-
-    if mqttc is None:
-        logger.warning("MQTT client not initialized, skipping publish.")
-        return
-
-    classification_data = {
-        "timestamp": classification_timestamp,
-        "value": classification_value,
-        "label": classification_label,
-        "anomaly": classification_anomaly,
-    }
-
-    try:
-        mqttc.publish(
-            "internal/gesture-classifications",
-            json.dumps(classification_data),
-            qos=0,
-            retain=False
-        )
-        logger.info("Published classification data")
-    except Exception as e:
-        logger.error(f"Failed to publish classification data: {e}")
-    
-    # Publish control commands based on gesture classification
-    if classification_label == "Right Swipe Gesture":
-        try:
-            mqttc.publish(
-                "cmnd/sofa/POWER",
-                "OFF",
-                qos=0,
-                retain=False
-            )
-            logger.info("Published ON command to cmnd/sofa/POWER")
-        except Exception as e:
-            logger.error(f"Failed to publish ON command: {e}")
-    
-    elif classification_label == "Left Swipe Gesture":
-        try:
-            mqttc.publish(
-                "cmnd/sofa/POWER",
-                "ON",
-                qos=0,
-                retain=False
-            )
-            logger.info("Published OFF command to cmnd/sofa/POWER")
-        except Exception as e:
-            logger.error(f"Failed to publish OFF command: {e}")
-
-
-def publish_dsp_timings():
-    global dsp_timing, classification_timing, anomaly_timing
-    global mqttc
-
-    if mqttc is None:
-        logger.warning("MQTT client not initialized, skipping publish.")
-        return
-
-    timings_data = {
-        "dsp_timing_ms": dsp_timing,
-        "classification_timing_ms": classification_timing,
-        "anomaly_timing_ms": anomaly_timing,
-    }
-
-    try:
-        mqttc.publish(
-            "internal/dsp-timings",
-            json.dumps(timings_data),
-            qos=0,
-            retain=False
-        )
-        logger.info("Published DSP timings")
-    except Exception as e:
-        logger.error(f"Failed to publish DSP timings: {e}")
 
 
 if __name__ == "__main__":
