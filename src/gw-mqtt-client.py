@@ -72,6 +72,7 @@ async def find_ble_device(address: Optional[str], name: Optional[str], use_bdadd
         device = await BleakScanner.find_device_by_address(
             address,
             timeout=20.0,
+            cb={"use_bdaddr": use_bdaddr},
         )
         
         if device is not None:
@@ -80,7 +81,7 @@ async def find_ble_device(address: Optional[str], name: Optional[str], use_bdadd
         
         # Fallback: Scan all devices and match by address (works better on macOS)
         logger.warning("Direct address lookup failed. Scanning all devices...")
-        scanner = BleakScanner()
+        scanner = BleakScanner(cb={"use_bdaddr": use_bdaddr})
         devices = await scanner.discover(timeout=20.0)
         
         # Normalize address for comparison (handle different formats)
