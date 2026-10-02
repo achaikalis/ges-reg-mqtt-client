@@ -1,0 +1,27 @@
+[Unit]
+Description=GATT to MQTT gateway for the gesture-control wearable (Raspberry Pi)
+Documentation=https://github.com/achaikalis/ges-reg-mqtt-client
+# BlueZ must be up before we can scan/connect over BLE
+Wants=bluetooth.target
+After=bluetooth.target network-online.target
+# Restart the gateway if it dies
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Update to your deployment path. The script writes logs to ../logs/mqtt-client-logs.txt,
+# so WorkingDirectory MUST be the src/ directory for the relative path to resolve.
+WorkingDirectory=/opt/gw-mqtt-client/src
+ExecStart=/opt/gw-mqtt-client/env/bin/python gw-mqtt-client-raspi.py --address 86:d5:2c:45:e7:3c --broker 10.10.30.200 --port 1883
+# BlueZ D-Bus access: either run as root (default) or as a user in the
+# bluetooth group with the D-Bus policy permitting it.
+Restart=on-failure
+RestartSec=5
+# Hardening that does not interfere with BlueZ D-Bus access
+Nice=-5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
