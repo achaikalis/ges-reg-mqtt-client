@@ -52,6 +52,9 @@ dsp_timing               : Optional[int]   = None
 classification_timing    : Optional[int]   = None
 anomaly_timing           : Optional[int]   = None
 
+# Guard against duplicate publishes: last timestamp that was actually published
+last_published_timestamp : Optional[int]   = None
+
 mqttc : Optional[mqtt.Client] = None  # Global MQTT client reference
 
 class Args(argparse.Namespace):
@@ -90,16 +93,16 @@ async def find_ble_device(address: Optional[str], name: Optional[str]) -> Option
             logger.warning("No BLE devices found during scan. Check that the Bluetooth adapter is powered on.")
 
         return None
-    
+
     elif name:
         logger.info(f"Searching for device with name: {name}")
         device = await BleakScanner.find_device_by_name(name, timeout=20.0)
-        
+
         if device is None:
             logger.error(f"Device with name {name} not found.")
-        
+
         return device
-    
+
     else:
         logger.error("Either name or address must be provided.")
         return None
@@ -109,7 +112,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
     # MQTT Client Constructor with Callback API Version 2
     # Initialize AFTER device discovery to avoid blocking BLE scan
     global mqttc
-    
+
     mqttc = mqtt.Client(
         client_id="gesture-control-wearable",
         transport="tcp",
@@ -138,7 +141,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
 
     # Find BLE device via BlueZ
     device = await find_ble_device(args.address, args.name)
-    
+
     if device is None:
         return
 
@@ -154,6 +157,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
 
         global classification_timestamp, classification_value, classification_label, classification_anomaly
         global dsp_timing, classification_timing, anomaly_timing
+        global last_published_timestamp
 
         # Arduino inference cycle: 4 seconds sampling + writeValue
         logger.info("Waiting 15 seconds for Arduino to complete first inference cycle...")
@@ -166,7 +170,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
         if not client.services:
             logger.error("The GATT Server has no services.")
             return
-        
+
         logger.info(f"Found {len(client.services.services)} services.")
 
         # Continuously read characteristics with retry logic
@@ -183,7 +187,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                     if not service.characteristics:
                         logger.warning(f"Service {service.uuid} has no characteristics.")
                         continue
-                    
+
                     char_count = len(service.characteristics)
                     logger.info(f"[{service_count}] Found {char_count} characteristics in service.")
 
@@ -191,20 +195,20 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                     char_index = 0
                     for characteristic in service.characteristics:
                         char_uuid = characteristic.uuid.lower()
-                        
-                        # Skip characteristics we're not interested in (filter to only our 4 expected ones)
+
+                        # Skip characteristics we're not interested in (filter to only our expected ones)
                         if char_uuid not in CLASSIFICATION_UUIDS.values():
                             logger.debug(f"Skipping unknown characteristic: {char_uuid}")
                             continue
-                        
+
                         char_index += 1
                         logger.info(f"[{service_count}.{char_index}] Processing characteristic: {char_uuid}")
-                        
+
                         # Check if characteristic is readable
                         if "read" not in str(characteristic.properties).lower():
                             logger.debug(f"Characteristic {char_uuid} is not readable. Properties: {characteristic.properties}")
                             continue
-                        
+
                         try:
                             if not client.is_connected:
                                 logger.error(
@@ -247,7 +251,7 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                         logger.info(f"Classification Value: {val}")
                                 except Exception as e:
                                     logger.error(
-                                        f"Failed to unpack classification value: {e}, raw value: {value}"
+                                        f"Failed to decode classification value: {e}, raw value: {value}"
                                     )
 
                             elif char_uuid == CLASSIFICATION_UUIDS["classification_label"]:
@@ -327,9 +331,6 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                 f"Characteristic: {characteristic.uuid}, {characteristic.handle}, ({characteristic.description}, {characteristic.properties}): {value}"
                             )
 
-                            publish_message()
-                            logger.info(f"[{service_count}.{char_index}] Characteristic processed and published.")
-
                         except asyncio.TimeoutError:
                             logger.warning(f"[{service_count}.{char_index}] Characteristic read TIMEOUT (5 sec) - device may be busy")
                             continue
@@ -346,11 +347,25 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
                                     f"[{service_count}.{char_index}] Read error: {e}"
                                 )
                             continue
-                
+
+                # End of read cycle: publish once, only for a new, valid classification
+                if (
+                    classification_label is not None
+                    and classification_label != ""
+                    and "\x00" not in classification_label
+                    and classification_timestamp is not None
+                    and classification_timestamp != last_published_timestamp
+                ):
+                    publish_message()
+                    last_published_timestamp = classification_timestamp
+                    logger.info("New classification published.")
+                else:
+                    logger.debug("No new valid classification, skipping publish.")
+
                 logger.info("Read cycle complete. Waiting 5 seconds before next cycle...")
                 # Wait before next read cycle (Arduino inference is ~4 seconds, so check every 5)
                 await asyncio.sleep(5)
-                
+
             except Exception as e:
                 logger.error(f"Error in read loop: {e}")
                 await asyncio.sleep(1)
@@ -372,7 +387,7 @@ async def discover_ble_devices():
     The callback function for when the client receives a CONNACK response from the broker.
 
     Args:
-       client, userdata, connect_flags, reason_code, properties 
+       client, userdata, connect_flags, reason_code, properties
 
 """
 
@@ -502,7 +517,7 @@ def on_publish(client: mqtt.Client, userdata: Any, mid: int, reason_code=None, p
         topic (str): The MQTT topic to publish to.
         payload (str): The message payload.
         qos (int, optional): The Quality of Service level. Defaults to 0.
-        retain (bool, optional): Whether to retain the message. Defaults to False.  
+        retain (bool, optional): Whether to retain the message. Defaults to False.
 
 """
 
@@ -532,7 +547,7 @@ def publish_message():
         logger.info("Published classification data")
     except Exception as e:
         logger.error(f"Failed to publish classification data: {e}")
-    
+
     # Publish control commands based on gesture classification
     if classification_label == "Right Swipe Gesture":
         try:
@@ -542,10 +557,10 @@ def publish_message():
                 qos=0,
                 retain=False
             )
-            logger.info("Published ON command to cmnd/sofa/POWER")
+            logger.info("Published OFF command to cmnd/sofa/POWER")
         except Exception as e:
-            logger.error(f"Failed to publish ON command: {e}")
-    
+            logger.error(f"Failed to publish OFF command: {e}")
+
     elif classification_label == "Left Swipe Gesture":
         try:
             mqttc.publish(
@@ -554,9 +569,9 @@ def publish_message():
                 qos=0,
                 retain=False
             )
-            logger.info("Published OFF command to cmnd/sofa/POWER")
+            logger.info("Published ON command to cmnd/sofa/POWER")
         except Exception as e:
-            logger.error(f"Failed to publish OFF command: {e}")
+            logger.error(f"Failed to publish ON command: {e}")
 
 
 def publish_dsp_timings():
@@ -589,21 +604,15 @@ if __name__ == "__main__":
     # Client-side Logger Setup
     logger = logging.getLogger(__name__)
 
-    # File Handler Configuration
-    # file_handler = logging.FileHandler("../logs/mqtt-client-logs.txt")
-    # file_handler.setLevel(logging.INFO)
-
     # Console Handler Configuration
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
 
     # Formatter Configuration
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    # file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
 
     # Adding Handlers to Logger
-    # logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     logger.setLevel(logging.INFO)
 
@@ -611,7 +620,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Command-line Argument Parser for the BLE Central"
     )
-    
+
     # Broker Argument (optional)
     parser.add_argument(
         "--broker",
