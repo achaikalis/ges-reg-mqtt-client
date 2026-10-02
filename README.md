@@ -40,8 +40,17 @@ python3 src/gw-mqtt-client.py --address 86:d5:2c:45:e7:3c --macos-use-bdaddr
 On Raspberry Pi 5 (BlueZ):
 
 ``` bash
-python3 src/gw-mqtt-client-raspi.py --address 86:d5:2c:45:e7:3c --broker 10.10.30.200 --port 1883 --pair
+python3 src/gw-mqtt-client-raspi.py --address 86:d5:2c:45:e7:3c --broker 10.10.30.200 --port 1883
 ```
+
+Do **not** pass `--pair` for the gesture wearable. The peripheral does not
+implement pairing/bonding, so when BlueZ requests authentication the device
+cancels it and the gateway fails with
+`bleak.exc.BleakDBusError: [org.bluez.Error.AuthenticationCanceled]` after a
+brief connect/disconnect cycle. The GATT characteristics in this sketch are
+unencrypted, so pairing is not required. If you previously attempted pairing,
+remove the stale bond with `bluetoothctl remove 86:D5:2C:45:E7:3C` before
+reconnecting.
 
 Cross-platform testing (macOS to RPi5, no BLE adapter or broker needed):
 
@@ -64,8 +73,8 @@ env/bin/pip install -r requirements.txt
 The script writes logs to `../logs/mqtt-client-logs.txt` relative to its working
 directory, so the service must start with `WorkingDirectory=/opt/gw-mqtt-client/src`.
 
-Edit `systemd/gw-mqtt-client.service` to match your BLE device address, MQTT broker
-and install path, then install and enable the unit:
+The unit starts the script without `--pair` (see Usage above). Edit it to match
+your BLE device address, MQTT broker and install path, then install and enable it:
 
 ``` bash
 sudo cp systemd/gw-mqtt-client.service /etc/systemd/system/
