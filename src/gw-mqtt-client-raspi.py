@@ -30,6 +30,9 @@ FIRST_RECONNECT_DELAY : int = 1
 MAX_RECONNECT_COUNT   : int = 12
 MAX_RECONNECT_DELAY   : int = 60
 
+BLE_SESSION_RECONNECT_DELAY : int = 5    # delay between supervisor retry attempts
+MQTT_RECONNECT_DELAY        : int = 5    # delay between MQTT reconnect attempts
+
 CLASSIFICATION_UUIDS = {
     "classification_timestamp" : str(UUID("f3a38005-66ac-4ec8-9bab-30e77ac32ae8")).lower(),
     "classification_value"     : str(UUID("f753a6c0-350d-42ab-a7bb-104957c8a7e1")).lower(),
@@ -66,6 +69,23 @@ class Args(argparse.Namespace):
     pair              : bool          # BlueZ handles pairing natively on Linux
     debug             : bool
 # fmt: on
+
+
+def reset_session_state() -> None:
+    """Reset per-connection classification state so stale data from a
+    previous session is never published as a new result."""
+    global classification_timestamp, classification_value, classification_label
+    global classification_anomaly, dsp_timing, classification_timing, anomaly_timing
+    global last_published_timestamp
+
+    classification_timestamp = None
+    classification_value     = None
+    classification_label     = None
+    classification_anomaly   = None
+    dsp_timing               = None
+    classification_timing    = None
+    anomaly_timing           = None
+    last_published_timestamp = None
 
 
 async def find_ble_device(address: Optional[str], name: Optional[str]) -> Optional[BLEDevice]:
@@ -108,42 +128,65 @@ async def find_ble_device(address: Optional[str], name: Optional[str]) -> Option
         return None
 
 
-async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = False):
-    # MQTT Client Constructor with Callback API Version 2
-    # Initialize AFTER device discovery to avoid blocking BLE scan
+def ensure_mqtt_connected(args: Args) -> None:
+    """Recreate and reconnect the MQTT client if it is down.
+    paho's network loop handles in-flight reconnects; this covers a
+    dead client object (e.g. after a broker-side disconnect loop failure)."""
     global mqttc
 
-    mqttc = mqtt.Client(
-        client_id="gesture-control-wearable",
-        transport="tcp",
-        callback_api_version=CallbackAPIVersion.VERSION2,
-        clean_session=True,
-    )
+    if mqttc is not None and mqttc.is_connected():
+        return
 
-    # Enable MQTT Logging
-    mqttc.enable_logger()
+    logger.warning("MQTT client is down. Reconnecting...")
 
-    # Callback Function Bindings
-    # fmt: off
-    mqttc.on_connect      = on_connect
-    mqttc.on_connect_fail = on_connect_fail
-    mqttc.on_disconnect   = on_disconnect
-    mqttc.on_message      = on_message
-    mqttc.on_publish      = on_publish
-    # fmt: on
-
-    # Connect to MQTT broker (now non-blocking in context of device discovery)
     try:
+        if mqttc is not None:
+            try:
+                mqttc.loop_stop()
+            except Exception:
+                pass
+
+        mqttc = mqtt.Client(
+            client_id="gesture-control-wearable",
+            transport="tcp",
+            callback_api_version=CallbackAPIVersion.VERSION2,
+            clean_session=True,
+        )
+        mqttc.enable_logger()
+
+        # Callback Function Bindings
+        # fmt: off
+        mqttc.on_connect      = on_connect
+        mqttc.on_connect_fail = on_connect_fail
+        mqttc.on_disconnect   = on_disconnect
+        mqttc.on_message      = on_message
+        mqttc.on_publish      = on_publish
+        # fmt: on
+
         mqttc.connect(args.broker, args.port, 60)
         mqttc.loop_start()
+        logger.info("MQTT reconnected.")
+
     except Exception as e:
-        logger.warning(f"MQTT connection failed: {e}. Continuing with BLE scan only.")
+        logger.error(f"MQTT reconnection failed: {e}")
+
+
+async def run_ble_session(args: Args) -> None:
+    """One full BLE session: discover, connect, read loop.
+    Raises on unrecoverable errors so the supervisor can retry.
+    Never exits the process on its own."""
+    global classification_timestamp, classification_value, classification_label
+    global classification_anomaly, dsp_timing, classification_timing, anomaly_timing
+    global last_published_timestamp
+
+    # MQTT Client Constructor with Callback API Version 2
+    ensure_mqtt_connected(args)
 
     # Find BLE device via BlueZ
     device = await find_ble_device(args.address, args.name)
 
     if device is None:
-        return
+        raise ConnectionError("BLE device not found; will rescan.")
 
     logger.info("Connecting to device...")
 
@@ -155,220 +198,243 @@ async def read_gatt_server_characteristics(args: Args, show_descriptors: bool = 
     ) as client:
         logger.info(f"Connected to {device.name} with MAC Address: ({device.address})")
 
-        global classification_timestamp, classification_value, classification_label, classification_anomaly
-        global dsp_timing, classification_timing, anomaly_timing
-        global last_published_timestamp
+        # Reset stale state from any previous session
+        reset_session_state()
 
         # Arduino inference cycle: 4 seconds sampling + writeValue
         logger.info("Waiting 15 seconds for Arduino to complete first inference cycle...")
         await asyncio.sleep(15)
         if not client.is_connected:
-            logger.error("Connection isn't stable.")
-            return
+            raise ConnectionError("Connection isn't stable.")
 
         # Process services and characteristics
         if not client.services:
-            logger.error("The GATT Server has no services.")
-            return
+            raise ConnectionError("The GATT Server has no services.")
 
         logger.info(f"Found {len(client.services.services)} services.")
 
         # Continuously read characteristics with retry logic
         max_consecutive_failures = 0
         while True:
-            try:
-                service_count = 0
-                for service in client.services:
-                    service_count += 1
-                    logger.info(
-                        f"[{service_count}] Processing Service: {service.uuid}"
-                    )
+            ensure_mqtt_connected(args)
 
-                    if not service.characteristics:
-                        logger.warning(f"Service {service.uuid} has no characteristics.")
+            if not client.is_connected:
+                raise ConnectionError("BLE central disconnected.")
+
+            service_count = 0
+            for service in client.services:
+                service_count += 1
+                logger.info(
+                    f"[{service_count}] Processing Service: {service.uuid}"
+                )
+
+                if not service.characteristics:
+                    logger.warning(f"Service {service.uuid} has no characteristics.")
+                    continue
+
+                char_count = len(service.characteristics)
+                logger.info(f"[{service_count}] Found {char_count} characteristics in service.")
+
+                # Read each characteristic once with proper error handling
+                char_index = 0
+                for characteristic in service.characteristics:
+                    char_uuid = characteristic.uuid.lower()
+
+                    # Skip characteristics we're not interested in (filter to only our expected ones)
+                    if char_uuid not in CLASSIFICATION_UUIDS.values():
+                        logger.debug(f"Skipping unknown characteristic: {char_uuid}")
                         continue
 
-                    char_count = len(service.characteristics)
-                    logger.info(f"[{service_count}] Found {char_count} characteristics in service.")
+                    char_index += 1
+                    logger.info(f"[{service_count}.{char_index}] Processing characteristic: {char_uuid}")
 
-                    # Read each characteristic once with proper error handling
-                    char_index = 0
-                    for characteristic in service.characteristics:
-                        char_uuid = characteristic.uuid.lower()
+                    # Check if characteristic is readable
+                    if "read" not in str(characteristic.properties).lower():
+                        logger.debug(f"Characteristic {char_uuid} is not readable. Properties: {characteristic.properties}")
+                        continue
 
-                        # Skip characteristics we're not interested in (filter to only our expected ones)
-                        if char_uuid not in CLASSIFICATION_UUIDS.values():
-                            logger.debug(f"Skipping unknown characteristic: {char_uuid}")
-                            continue
-
-                        char_index += 1
-                        logger.info(f"[{service_count}.{char_index}] Processing characteristic: {char_uuid}")
-
-                        # Check if characteristic is readable
-                        if "read" not in str(characteristic.properties).lower():
-                            logger.debug(f"Characteristic {char_uuid} is not readable. Properties: {characteristic.properties}")
-                            continue
-
-                        try:
-                            if not client.is_connected:
-                                logger.error(
-                                    "Client disconnected, skipping characteristic reading."
-                                )
-                                return
-
-                            logger.info(f"[{service_count}.{char_index}] Reading characteristic {char_uuid}...")
-                            value = await asyncio.wait_for(
-                                client.read_gatt_char(characteristic.uuid),
-                                timeout=5.0
-                            )
-                            max_consecutive_failures = 0  # Reset counter on successful read
-                            logger.info(f"[{service_count}.{char_index}] Read success, length: {len(value)} bytes")
-
-                            if char_uuid == CLASSIFICATION_UUIDS["classification_timestamp"]:
-                                try:
-                                    if len(value) != 8:
-                                        logger.error(
-                                            f"Timestamp characteristic value length is {len(value)}, expected 8 bytes."
-                                        )
-                                    else:
-                                        (ts,) = struct.unpack("<Q", value)
-                                        classification_timestamp = ts
-                                        logger.info(f"Classification Timestamp: {ts}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to unpack timestamp value: {e}, raw value: {value}"
-                                    )
-
-                            elif char_uuid == CLASSIFICATION_UUIDS["classification_value"]:
-                                try:
-                                    if len(value) != 4:
-                                        logger.error(
-                                            f"Classification value characteristic length is {len(value)}, expected 4 bytes."
-                                        )
-                                    else:
-                                        (val,) = struct.unpack("<f", value)
-                                        classification_value = val
-                                        logger.info(f"Classification Value: {val}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to decode classification value: {e}, raw value: {value}"
-                                    )
-
-                            elif char_uuid == CLASSIFICATION_UUIDS["classification_label"]:
-                                try:
-                                    label = value.decode("utf-8").strip("\x00")
-                                    classification_label = label
-                                    logger.info(f"Classification Label: {label}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to decode classification label: {e}, raw value: {value}"
-                                    )
-
-                            elif char_uuid == CLASSIFICATION_UUIDS["classification_anomaly"]:
-                                try:
-                                    if len(value) != 4:
-                                        logger.error(
-                                            f"Classification anomaly characteristic length is {len(value)}, expected 4 bytes."
-                                        )
-                                    else:
-                                        (anomaly,) = struct.unpack("<f", value)
-                                        classification_anomaly = anomaly
-                                        logger.info(f"Classification Anomaly: {anomaly}")
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to unpack classification anomaly: {e}, raw value: {value}"
-                                    )
-
-                            elif char_uuid == CLASSIFICATION_UUIDS["dsp_timing"]:
-                                try:
-                                    if len(value) != 4:
-                                        logger.error(
-                                            f"DSP timing characteristic length is {len(value)}, expected 4 bytes."
-                                        )
-                                    else:
-                                        (timing,) = struct.unpack("<I", value)
-                                        dsp_timing = timing
-                                        logger.info(f"DSP Timing: {timing} ms")
-                                        publish_dsp_timings()
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to unpack DSP timing: {e}, raw value: {value}"
-                                    )
-
-                            elif char_uuid == CLASSIFICATION_UUIDS["classification_timing"]:
-                                try:
-                                    if len(value) != 4:
-                                        logger.error(
-                                            f"Classification timing characteristic length is {len(value)}, expected 4 bytes."
-                                        )
-                                    else:
-                                        (timing,) = struct.unpack("<I", value)
-                                        classification_timing = timing
-                                        logger.info(f"Classification Timing: {timing} ms")
-                                        publish_dsp_timings()
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to unpack classification timing: {e}, raw value: {value}"
-                                    )
-
-                            elif char_uuid == CLASSIFICATION_UUIDS["anomaly_timing"]:
-                                try:
-                                    if len(value) != 4:
-                                        logger.error(
-                                            f"Anomaly timing characteristic length is {len(value)}, expected 4 bytes."
-                                        )
-                                    else:
-                                        (timing,) = struct.unpack("<I", value)
-                                        anomaly_timing = timing
-                                        logger.info(f"Anomaly Timing: {timing} ms")
-                                        publish_dsp_timings()
-                                except Exception as e:
-                                    logger.error(
-                                        f"Failed to unpack anomaly timing: {e}, raw value: {value}"
-                                    )
-
-                            logger.info(
-                                f"Characteristic: {characteristic.uuid}, {characteristic.handle}, ({characteristic.description}, {characteristic.properties}): {value}"
+                    try:
+                        if not client.is_connected:
+                            raise ConnectionError(
+                                "Client disconnected, skipping characteristic reading."
                             )
 
-                        except asyncio.TimeoutError:
-                            logger.warning(f"[{service_count}.{char_index}] Characteristic read TIMEOUT (5 sec) - device may be busy")
-                            continue
-                        except Exception as e:
-                            # "The offset is invalid" = characteristic has no data yet (Arduino hasn't written)
-                            error_str = str(e).lower()
-                            if "offset is invalid" in error_str:
-                                logger.debug(
-                                    f"[{service_count}.{char_index}] Characteristic {char_uuid} has no data yet"
-                                )
-                            else:
-                                max_consecutive_failures += 1
+                        logger.info(f"[{service_count}.{char_index}] Reading characteristic {char_uuid}...")
+                        value = await asyncio.wait_for(
+                            client.read_gatt_char(characteristic.uuid),
+                            timeout=5.0
+                        )
+                        max_consecutive_failures = 0  # Reset counter on successful read
+                        logger.info(f"[{service_count}.{char_index}] Read success, length: {len(value)} bytes")
+
+                        if char_uuid == CLASSIFICATION_UUIDS["classification_timestamp"]:
+                            try:
+                                if len(value) != 8:
+                                    logger.error(
+                                        f"Timestamp characteristic value length is {len(value)}, expected 8 bytes."
+                                    )
+                                else:
+                                    (ts,) = struct.unpack("<Q", value)
+                                    classification_timestamp = ts
+                                    logger.info(f"Classification Timestamp: {ts}")
+                            except Exception as e:
                                 logger.error(
-                                    f"[{service_count}.{char_index}] Read error: {e}"
+                                    f"Failed to unpack timestamp value: {e}, raw value: {value}"
                                 )
-                            continue
 
-                # End of read cycle: publish once, only for a new, valid classification
-                if (
-                    classification_label is not None
-                    and classification_label != ""
-                    and "\x00" not in classification_label
-                    and classification_timestamp is not None
-                    and classification_timestamp != last_published_timestamp
-                ):
-                    publish_message()
-                    last_published_timestamp = classification_timestamp
-                    logger.info("New classification published.")
-                else:
-                    logger.debug("No new valid classification, skipping publish.")
+                        elif char_uuid == CLASSIFICATION_UUIDS["classification_value"]:
+                            try:
+                                if len(value) != 4:
+                                    logger.error(
+                                        f"Classification value characteristic length is {len(value)}, expected 4 bytes."
+                                    )
+                                else:
+                                    (val,) = struct.unpack("<f", value)
+                                    classification_value = val
+                                    logger.info(f"Classification Value: {val}")
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to unpack classification value: {e}, raw value: {value}"
+                                )
 
-                logger.info("Read cycle complete. Waiting 5 seconds before next cycle...")
-                # Wait before next read cycle (Arduino inference is ~4 seconds, so check every 5)
-                await asyncio.sleep(5)
+                        elif char_uuid == CLASSIFICATION_UUIDS["classification_label"]:
+                            try:
+                                label = value.decode("utf-8").strip("\x00")
+                                classification_label = label
+                                logger.info(f"Classification Label: {label}")
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to decode classification label: {e}, raw value: {value}"
+                                )
 
-            except Exception as e:
-                logger.error(f"Error in read loop: {e}")
-                await asyncio.sleep(1)
+                        elif char_uuid == CLASSIFICATION_UUIDS["classification_anomaly"]:
+                            try:
+                                if len(value) != 4:
+                                    logger.error(
+                                        f"Classification anomaly characteristic length is {len(value)}, expected 4 bytes."
+                                    )
+                                else:
+                                    (anomaly,) = struct.unpack("<f", value)
+                                    classification_anomaly = anomaly
+                                    logger.info(f"Classification Anomaly: {anomaly}")
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to unpack classification anomaly: {e}, raw value: {value}"
+                                )
+
+                        elif char_uuid == CLASSIFICATION_UUIDS["dsp_timing"]:
+                            try:
+                                if len(value) != 4:
+                                    logger.error(
+                                        f"DSP timing characteristic length is {len(value)}, expected 4 bytes."
+                                    )
+                                else:
+                                    (timing,) = struct.unpack("<I", value)
+                                    dsp_timing = timing
+                                    logger.info(f"DSP Timing: {timing} ms")
+                                    publish_dsp_timings()
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to unpack DSP timing: {e}, raw value: {value}"
+                                )
+
+                        elif char_uuid == CLASSIFICATION_UUIDS["classification_timing"]:
+                            try:
+                                if len(value) != 4:
+                                    logger.error(
+                                        f"Classification timing characteristic length is {len(value)}, expected 4 bytes."
+                                    )
+                                else:
+                                    (timing,) = struct.unpack("<I", value)
+                                    classification_timing = timing
+                                    logger.info(f"Classification Timing: {timing} ms")
+                                    publish_dsp_timings()
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to unpack classification timing: {e}, raw value: {value}"
+                                )
+
+                        elif char_uuid == CLASSIFICATION_UUIDS["anomaly_timing"]:
+                            try:
+                                if len(value) != 4:
+                                    logger.error(
+                                        f"Anomaly timing characteristic length is {len(value)}, expected 4 bytes."
+                                    )
+                                else:
+                                    (timing,) = struct.unpack("<I", value)
+                                    anomaly_timing = timing
+                                    logger.info(f"Anomaly Timing: {timing} ms")
+                                    publish_dsp_timings()
+                            except Exception as e:
+                                logger.error(
+                                    f"Failed to unpack anomaly timing: {e}, raw value: {value}"
+                                )
+
+                        logger.info(
+                            f"Characteristic: {characteristic.uuid}, {characteristic.handle}, ({characteristic.description}, {characteristic.properties}): {value}"
+                        )
+
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[{service_count}.{char_index}] Characteristic read TIMEOUT (5 sec) - device may be busy")
+                        continue
+                    except ConnectionError:
+                        raise
+                    except Exception as e:
+                        # "The offset is invalid" = characteristic has no data yet (Arduino hasn't written)
+                        error_str = str(e).lower()
+                        if "offset is invalid" in error_str:
+                            logger.debug(
+                                f"[{service_count}.{char_index}] Characteristic {char_uuid} has no data yet"
+                            )
+                        else:
+                            max_consecutive_failures += 1
+                            logger.error(
+                                f"[{service_count}.{char_index}] Read error: {e}"
+                            )
+                        continue
+
+            # End of read cycle: publish once, only for a new, valid classification
+            if (
+                classification_label is not None
+                and classification_label != ""
+                and "\x00" not in classification_label
+                and classification_timestamp is not None
+                and classification_timestamp != last_published_timestamp
+            ):
+                publish_message()
+                last_published_timestamp = classification_timestamp
+                logger.info("New classification published.")
+            else:
+                logger.debug("No new valid classification, skipping publish.")
+
+            logger.info("Read cycle complete. Waiting 5 seconds before next cycle...")
+            # Wait before next read cycle (Arduino inference is ~4 seconds, so check every 5)
+            await asyncio.sleep(5)
+
+
+async def run_forever(args: Args) -> None:
+    """Supervisor: runs BLE sessions forever. A board crash, BLE
+    disconnect, or scan failure triggers a retry with exponential
+    backoff instead of exiting the process."""
+    backoff = BLE_SESSION_RECONNECT_DELAY
+
+    while True:
+        try:
+            logger.info("Starting BLE session...")
+            await run_ble_session(args)
+            backoff = BLE_SESSION_RECONNECT_DELAY  # reset backoff on clean exit
+
+        except asyncio.CancelledError:
+            logger.info("Shutdown requested. Exiting supervisor.")
+            raise
+
+        except Exception as e:
+            logger.error(f"Session lost: {e}. Reconnecting in {backoff}s")
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * RECONNECT_RATE, MAX_RECONNECT_DELAY)
 
 
 async def on_device_discovery_callback(
@@ -401,7 +467,7 @@ def on_connect(
     properties    : Optional[Any] = None,
     # fmt: on
 ):
-    print(
+    logger.info(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
         + " Connection returned result code: "
         + ack(reason_code)
@@ -419,7 +485,7 @@ def on_connect(
 
 
 def on_connect_fail(client: mqtt.Client, userdata: Any):
-    print(
+    logger.warning(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
         + " Reconnecting after failed connection attempt."
     )
@@ -443,28 +509,14 @@ def on_disconnect(
     properties          : Optional[Any] = None,
     # fmt: on
 ):
-    print(
+    logger.info(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
         + " Disconnection returned result code: "
         + ack(reason_code)
     )
-
-    reconnect_count, reconnect_delay = 0, FIRST_RECONNECT_DELAY
-    while reconnect_count < MAX_RECONNECT_COUNT:
-        logging.info("Reconnecting in %d seconds ...", reconnect_delay)
-        time.sleep(reconnect_delay)
-
-        try:
-            client.reconnect()
-            logging.info("Reconnected successfully!")
-            return
-        except Exception as err:
-            logging.error("%s. Reconnect failed. Retrying...", err)
-
-        reconnect_delay *= RECONNECT_RATE
-        reconnect_delay = min(reconnect_delay, MAX_RECONNECT_DELAY)
-        reconnect_count += 1
-    logging.info("Reconnect failed after %s attempts. Exiting ...", reconnect_count)
+    # NOTE: No blocking reconnect loop here. paho's loop will reconnect
+    # automatically (reconnect_delay_set), and ensure_mqtt_connected()
+    # recreates the client if it dies entirely.
 
 
 """
@@ -484,7 +536,7 @@ def on_message(
     properties : Optional[Any] = None,
     # fmt: on
 ):
-    print(
+    logger.info(
         datetime.now().strftime("%H:%M:%S.%f")[:-2]
         + " Received message with payload: %s on topic: %s with QoS level: %s"
         % (str(message.payload), message.topic, str(message.qos))
@@ -526,8 +578,8 @@ def publish_message():
     global classification_timestamp, classification_value, classification_label, classification_anomaly
     global classification_data, mqttc
 
-    if mqttc is None:
-        logger.warning("MQTT client not initialized, skipping publish.")
+    if mqttc is None or not mqttc.is_connected():
+        logger.warning("MQTT client not connected, skipping publish.")
         return
 
     classification_data = {
@@ -578,8 +630,8 @@ def publish_dsp_timings():
     global dsp_timing, classification_timing, anomaly_timing
     global mqttc
 
-    if mqttc is None:
-        logger.warning("MQTT client not initialized, skipping publish.")
+    if mqttc is None or not mqttc.is_connected():
+        logger.warning("MQTT client not connected, skipping publish.")
         return
 
     timings_data = {
@@ -600,8 +652,10 @@ def publish_dsp_timings():
         logger.error(f"Failed to publish DSP timings: {e}")
 
 
-if __name__ == "__main__":
+def main() -> None:
     # Client-side Logger Setup
+    global logger
+
     logger = logging.getLogger(__name__)
 
     # Console Handler Configuration
@@ -660,8 +714,24 @@ if __name__ == "__main__":
 
     args = parser.parse_args(namespace=Args())
 
-    try:
-        asyncio.run(read_gatt_server_characteristics(args))
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        console_handler.setLevel(logging.DEBUG)
 
-    except asyncio.CancelledError as e:
-        logger.error(f"An error occurred: {e}")
+    if not args.name and not args.address:
+        parser.error("Either --name or --address must be provided.")
+
+    # Never exits on its own: run_forever retries forever.
+    # KeyboardInterrupt is the only intended way to stop.
+    try:
+        asyncio.run(run_forever(args))
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user. Shutting down.")
+
+    except asyncio.CancelledError:
+        logger.info("Task cancelled. Shutting down.")
+
+
+if __name__ == "__main__":
+    main()
