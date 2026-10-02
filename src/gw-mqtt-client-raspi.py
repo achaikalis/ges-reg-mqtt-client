@@ -590,8 +590,8 @@ if __name__ == "__main__":
     logger = logging.getLogger(__name__)
 
     # File Handler Configuration
-    file_handler = logging.FileHandler("../logs/mqtt-client-logs.txt")
-    file_handler.setLevel(logging.INFO)
+    # file_handler = logging.FileHandler("../logs/mqtt-client-logs.txt")
+    # file_handler.setLevel(logging.INFO)
 
     # Console Handler Configuration
     console_handler = logging.StreamHandler()
@@ -599,11 +599,11 @@ if __name__ == "__main__":
 
     # Formatter Configuration
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    file_handler.setFormatter(formatter)
+    # file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
 
     # Adding Handlers to Logger
-    logger.addHandler(file_handler)
+    # logger.addHandler(file_handler)
     logger.addHandler(console_handler)
     logger.setLevel(logging.INFO)
 
